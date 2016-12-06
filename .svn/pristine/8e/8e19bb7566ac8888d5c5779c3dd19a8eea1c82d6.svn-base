@@ -1,0 +1,1050 @@
+/*
+*******************************************************************************
+* $Header: $
+*
+*  Copyright (c) 2000-2010 VIVOTEK Inc. All rights reserved.
+*
+*  +-----------------------------------------------------------------+
+*  | THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY ONLY BE USED |
+*  | AND COPIED IN ACCORDANCE WITH THE TERMS AND CONDITIONS OF SUCH  |
+*  | A LICENSE AND WITH THE INCLUSION OF THE THIS COPY RIGHT NOTICE. |
+*  | THIS SOFTWARE OR ANY OTHER COPIES OF THIS SOFTWARE MAY NOT BE   |
+*  | PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON. THE   |
+*  | OWNERSHIP AND TITLE OF THIS SOFTWARE IS NOT TRANSFERRED.        |
+*  |                                                                 |
+*  | THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT   |
+*  | ANY PRIOR NOTICE AND SHOULD NOT BE CONSTRUED AS A COMMITMENT BY |
+*  | VIVOTEK INC.                                                    |
+*  +-----------------------------------------------------------------+
+*
+* $History: $
+*/
+
+/*!
+*******************************************************************************
+* Copyright 2000-2010 VIVOTEK, Inc. All rights reserved.
+*
+* \file
+* focusmotor.c
+*
+* \brief
+* source file of focus motor control driver.
+*
+* \date
+* 2010/12/21
+*
+* \author
+* James Ye (reference piris driver written by Evan Huang)
+*
+*******************************************************************************
+*/
+
+/* Include linux kernel header files */
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/stddef.h>
+#include <linux/i2c.h>
+#include <linux/io.h>
+#include <linux/init.h>
+#include <linux/delay.h>
+#include <linux/ioctl.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <linux/completion.h>
+
+#if defined _TI_DM365
+#include <asm/uaccess.h>
+#include <asm/hardware.h>
+#include <asm/mach-types.h>
+#include <asm-arm/arch-davinci/mux.h>
+#include <asm/arch/gpio.h>
+#include <asm/arch/i2c-client.h>
+#include <asm/mach/irq.h>
+#include <asm/arch/time.h>
+#include <asm/arch/irqs.h>
+#include <asm/arch/hardware.h>
+#elif defined _MOZART
+#include <mach/time.h>
+#include <mach/io.h> /* ioremap */
+#include <mach/irq.h>
+#include <mach/irqs.h>
+#include <mach/hardware.h>
+#include <mach/mozart.h>
+#endif 
+/* Include local header file */
+#include "focusmotor.h"
+#include "focusmotor_local.h"
+
+volatile char rcsid[] = "$Id: " MOTOR_DRIVER_VERSION " focus-motor-driver " MOTOR_LOG_DATE_TIME " $";
+
+struct completion fd_complete;
+static BOOL g_bPostSemaphore = FALSE; 
+static BOOL g_bHaltOperation = FALSE;
+static BOOL g_bMotorClose    = FALSE;
+static BOOL g_bFirstStep    = FALSE;
+static DWORD g_dwMotorStep = 0; // motor steps count;
+static BYTE g_byDEBUG = 0; // debug message level; 
+static DWORD *g_dwMotorSpeed = NULL; // motor speed table;
+static char *g_acForwardCmd = NULL; // motor forward;
+static char *g_acBackwardCmd = NULL; // motor backward;
+static char *g_pcLens = "DF010NA0000"; // Tamron DF010NA0000
+static int g_iMoveInverse = 0; // FD8362:0 , FD8372/IP8372/IP8172:1
+
+module_param(g_pcLens, charp, S_IRUGO);
+module_param(g_iMoveInverse, int, S_IRUGO);
+
+static atomic_t ac_tSystemInUse;
+
+#if defined _I2C_MODE
+char g_acForwardCmd[4] = {0x06, 0x07, 0x05, 0x04};
+char g_acBackwardCmd[4] = {0x05, 0x07, 0x06, 0x04};
+#else // _GPIO_MODE
+char g_acMoveClockwise[4] = {0x01, 0x03, 0x02, 0x00};
+char g_acMoveCounterclockwise[4] = {0x02, 0x03, 0x01, 0x00};
+#endif 
+
+#if defined _TI_DM365
+DWORD g_dwMotorSpeed_DF010NA0000[MOTOR_TIMER_SPEED_NUM+1] = {48000, 30000, 48000, 120000}; // 500pps, 800pps, 500pps, 200pps
+DWORD g_dwMotorSpeed_YC41AM[MOTOR_TIMER_SPEED_NUM+1] = {120000, 60000, 120000, 240000}; // 200pps, 400pps, 200pps, 100pps
+#elif defined _MOZART
+//DWORD g_dwMotorSpeed[MOTOR_TIMER_SPEED_NUM+1] = {333333, 333333, 666666, 999999}; // 3ms, 3ms, 6ms, 9ms
+#endif
+
+/* declare local functions */
+static int motor_open (struct inode *inode, struct file *filp);
+static int motor_ioctl (struct inode *inode, struct file *filp, unsigned int cmd, DWORD dwArg);
+static ssize_t motor_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos);
+static ssize_t motor_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos);
+static int motor_release (struct inode *inode, struct file *filp);
+
+static irqreturn_t motor_isr(int irq, void *dev_id);
+static int motor_timer_initial(DWORD dwTimer, DWORD dwTimerPeriod);
+static int motor_timer_period_setup(DWORD dwTimerPeriod);
+static int motor_int_clear(char);
+static int motor_int_wait(char);
+
+int motor_init_module(void);
+void motor_cleanup_module(void);
+
+#define DBG(x...) printk(x)
+
+#ifdef _DEBUG
+static struct timespec old_time;
+static int g_iCount;
+#endif 
+
+/* The device structure of Motor device */
+typedef struct {
+	BOOL	bForward;
+	DWORD	dwSpeed;
+	DWORD	dwDriveMode;
+	DWORD	dwI2CAddr;
+	BYTE	byBuf[MOTOR_BUF_LEN];
+	struct	semaphore sem;
+}TMotorDev;
+TMotorDev *g_ptMotorDev; 
+
+const int IRQ_NUM = MOTOR_IRQ_TIMER3;
+void *irq_dev_id = (void *)&IRQ_NUM;
+struct work_struct workq;
+
+/* ============================================================================= */
+#if defined _MOZART // (Mozart Only)
+static struct i2c_client *g_I2Client;
+static struct i2c_driver i2c_expander_driver;
+int mozart_i2c_write(int count,  const char *buf, int address);
+
+#define I2C_NAME(s) (s)->name
+/* The device structure of PCA9536 Expander */
+struct PCA953X {
+	struct i2c_client *client;
+};
+
+#if defined _I2C_MODE
+/* standard i2c insmod options */
+static unsigned short normal_i2c[] = { MOTOR_I2C_CLIENT_PCA9536_ADDRESS, I2C_CLIENT_END };
+I2C_CLIENT_INSMOD;
+
+#endif // (_I2C_MODE)
+#endif // (_MOZART)
+/* ============================================================================= */
+/******************************************************************************
+* motor_set_forward 
+*****************************************************************************/
+int motor_set_forward(TMotorDev *ptDevice)
+{
+	down_interruptible(&ptDevice->sem);
+	ptDevice->bForward = TRUE;
+	up(&ptDevice->sem);
+
+	return 0;
+}
+/******************************************************************************
+* motor_set_backward 
+*****************************************************************************/
+int motor_set_backward(TMotorDev *ptDevice)
+{
+	down_interruptible(&ptDevice->sem);
+	ptDevice->bForward = FALSE;
+	up(&ptDevice->sem);
+
+	return 0;
+}
+/******************************************************************************
+* motor_set_device 
+*****************************************************************************/
+int motor_set_device(TMotorDev *ptDevice, DWORD dwData)
+{
+	ptDevice->dwDriveMode = dwData;
+	DBG("%s Set motor_set_device :%d \n", MOTOR_SYSLOG_ID, ptDevice->dwDriveMode);
+	return 0;
+}
+/******************************************************************************
+* motor_set_speed 
+*****************************************************************************/
+int motor_set_speed(TMotorDev *ptDevice, DWORD dwData)
+{
+	down_interruptible(&ptDevice->sem);
+	ptDevice->dwSpeed = dwData;
+	motor_timer_period_setup(dwData);
+	
+	if (g_byDEBUG > 0)
+		DBG("Set motor_set_speed :%d \n", ptDevice->dwSpeed);
+
+	up(&ptDevice->sem);
+	return 0;
+}
+/******************************************************************************
+* motor_single_step 
+*****************************************************************************/
+int motor_single_step(BOOL bDirection)
+{
+	int		iRet = 0;
+	static	DWORD	dwQuantCount = 0;
+	static	BOOL	sbForward = TRUE;
+
+#if defined _GPIO_MODE
+	if (g_ptMotorDev->dwDriveMode == mdmGPIO)
+	{
+		if (g_bFirstStep)
+		{
+			if (bDirection == sbForward)
+			{
+				(dwQuantCount != 0) ? dwQuantCount-- : dwQuantCount;
+			}
+			else // change direction : table mapping Forward <--> Backward. 
+			{
+				if (dwQuantCount != 0)
+				{
+					dwQuantCount--;	
+					if (((dwQuantCount%4) == 0) || ((dwQuantCount%4) == 2))
+						dwQuantCount = dwQuantCount + 2; 
+				}
+			}
+			g_dwMotorStep++;
+			sbForward = bDirection;
+			g_bFirstStep = FALSE;
+		}
+
+		if (bDirection) // Forward
+		{
+#if defined _TI_DM365
+			gpio_set_value(MOTOR_ENABLE_PIN, 0x01);
+			gpio_set_value(MOTOR_GPIO_PIN_NUM_1, (g_acForwardCmd[(dwQuantCount%4)] >> 1));
+			gpio_set_value(MOTOR_GPIO_PIN_NUM_2, (g_acForwardCmd[(dwQuantCount%4)] & 0x01));
+#elif defined _MOZART
+			DBG("%s Not implement !!\n", MOTOR_SYSLOG_ID);
+#endif
+		}
+		else // Backward
+		{
+#if defined _TI_DM365
+			gpio_set_value(MOTOR_ENABLE_PIN, 0x01);
+			gpio_set_value(MOTOR_GPIO_PIN_NUM_1, (g_acBackwardCmd[(dwQuantCount%4)] >> 1));
+			gpio_set_value(MOTOR_GPIO_PIN_NUM_2, (g_acBackwardCmd[(dwQuantCount%4)] & 0x01));
+#elif defined _MOZART
+			DBG("%s !! Not implement !!\n", MOTOR_SYSLOG_ID);
+#endif
+		}
+	}
+#endif // _GPIO_MODE
+
+#if defined _I2C_MODE
+	if (g_ptMotorDev->dwDriveMode == mdmIOEXPAND)
+	{
+		char	acCmd[2] = {MOTOR_I2C_CLIENT_CONFIG_REG, 0x00};
+		acCmd[1] = (bDirection) ? g_acForwardCmd[(dwQuantCount%4)] : g_acBackwardCmd[(dwQuantCount%4)];
+
+#if defined _TI_DM365
+		iRet = davinci_i2c_write(sizeof(acCmd), acCmd, g_ptMotorDev->dwI2CAddr);
+#elif defined _MOZART
+		iRet = mozart_i2c_write(sizeof(acCmd), acCmd, g_ptMotorDev->dwI2CAddr);
+#endif 	
+		if (iRet < 0)
+			DBG("%s Write to I2C data failed !!\n", MOTOR_SYSLOG_ID);
+	}
+#endif // _I2C_MODE
+
+	dwQuantCount++;
+
+	return iRet;
+}
+/******************************************************************************
+* motor_walk_steps  (Non-Blocking Mode)
+*****************************************************************************/
+int motor_walk_steps(TMotorDev *ptDevice, DWORD dwData)
+{
+	if (g_byDEBUG > 0)
+		DBG("motor_walk_steps dwData:%d \n", dwData);
+
+	down_interruptible(&ptDevice->sem);
+	g_dwMotorStep = dwData;
+	g_bFirstStep = TRUE;
+	
+	return g_dwMotorStep;
+}
+/******************************************************************************
+* motor_walk_steps_block (Blocking Mode)
+*****************************************************************************/
+int motor_walk_steps_block(TMotorDev *ptDevice, DWORD dwData)
+{
+	if (g_byDEBUG > 0)
+		DBG("motor_walk_steps_block dwData:%d \n", dwData);
+
+	down_interruptible(&ptDevice->sem);
+	g_dwMotorStep = dwData;
+	g_bFirstStep = TRUE;
+
+       	motor_int_wait(1);
+        motor_int_clear(1);
+	
+	return g_dwMotorStep;
+}
+/******************************************************************************
+* motor_set_gpio_dire_output 
+*****************************************************************************/
+int motor_set_gpio_dire_output(TMotorDev *ptDevice, DWORD dwPinNum)
+{
+	/* Change Multiplexer setting to let GPIO89&90 do as GPIO do.*/
+#if defined _TI_DM365
+#if 0
+	unsigned int uiPinmux1;
+#else
+	unsigned int uiPinmux2;
+#endif
+	int iRet;
+	   
+	if (ptDevice->dwDriveMode != mdmGPIO)
+	{
+		if (g_byDEBUG > 0) 
+			DBG("%s It's not GPIO device type !!\n", MOTOR_SYSLOG_ID);
+		return -EFAULT;
+	}
+
+#if 0
+	uiPinmux1 = davinci_readl(PINMUX1);
+	uiPinmux1 &= ~(0x000003F0); // check the document, set gpio88/89/90 to GIO pin		
+	davinci_writel(uiPinmux1, PINMUX1);
+	//uiPinmux1 = davinci_readl(PINMUX1);
+#else
+	uiPinmux2 = davinci_readl(PINMUX2);
+	uiPinmux2 &= ~(0x00000033); // check the document, set gpio70~75 to GIO pin		
+	davinci_writel(uiPinmux2, PINMUX2);
+	//uiPinmux1 = davinci_readl(PINMUX1);
+#endif
+
+	iRet = gpio_direction_output(dwPinNum, 1);
+	
+	if (iRet != 0)
+	{
+		if (g_byDEBUG > 0) 
+			DBG("%s Set GPIO %d Direction Output Fail !!\n", MOTOR_SYSLOG_ID, dwPinNum);
+	}
+	else
+	{
+		DBG("%s Set motor_set_gpio_dire_output :%d \n", MOTOR_SYSLOG_ID, dwPinNum);
+	}
+#elif defined _MOZART
+	return -1;
+#endif 	
+
+	return 0;
+}
+/******************************************************************************
+* motor_set_i2c_client_addr 
+*****************************************************************************/
+int motor_set_i2c_client_addr(TMotorDev *ptDevice, DWORD dwAddr)
+{
+	int iRet = 0;
+#if defined _I2C_MODE
+	char acCmd[2] = {MOTOR_I2C_CLIENT_OUTPORT_REG, 0xF0};
+
+	if (ptDevice->dwDriveMode != mdmIOEXPAND)
+	{
+		if (g_byDEBUG > 0) 
+			DBG("%s It's not I2C device type !!\n", MOTOR_SYSLOG_ID);
+		return -EFAULT;
+	}
+
+	ptDevice->dwI2CAddr = dwAddr;	
+	DBG("%s Set motor_set_i2c_client_addr :%d \n", MOTOR_SYSLOG_ID, ptDevice->dwI2CAddr);
+
+	// set Output port register bit of I/O Expander
+#if defined _TI_DM365
+	iRet = davinci_i2c_write(sizeof(acCmd), acCmd, ptDevice->dwI2CAddr);
+#elif defined _MOZART
+	iRet = mozart_i2c_write(sizeof(acCmd), acCmd, ptDevice->dwI2CAddr);
+#endif 
+
+#endif // _I2C_MODE
+	return iRet;
+}
+/******************************************************************************
+* motor_system_log 
+*****************************************************************************/
+int motor_system_log(TMotorDev *ptDevice, DWORD dwLogLevel)
+{
+	if (dwLogLevel > 0)
+	{
+		DBG("Motor-Focus Info:\n \
+			Current Direction: %s \n \
+			Current Speed: %d \n \
+			Current Device Mode: %d \n \
+			Current I2C Address: 0x%X \n", (ptDevice->bForward) ? "Forward": "Backward"
+										, ptDevice->dwSpeed
+										, ptDevice->dwDriveMode
+										, ptDevice->dwI2CAddr);
+	}
+
+	return 0;
+}
+/******************************************************************************
+* motor_workqueue : avoid i2c bus sleep to kill the IRQ
+*****************************************************************************/
+void motor_workqueue(struct work_struct *work)
+{
+	if (g_byDEBUG > 0)
+		DBG("%s called (%ld, %ld, %ld) pid %d\n", __func__, in_irq(), in_softirq(), in_interrupt(), current->pid);
+
+	motor_single_step(g_ptMotorDev->bForward);
+}
+/******************************************************************************
+* motor_isr : interrupt service routine function
+*****************************************************************************/
+static irqreturn_t motor_isr(int irq, void *dev_id)
+{
+#ifdef _DEBUG
+	struct timespec now = current_kernel_time();
+
+	if (old_time.tv_sec != now.tv_sec)
+	{
+		//DBG("g_iCount :%d \n", g_iCount);
+		g_iCount = 0;
+		old_time.tv_sec = now.tv_sec;
+	}
+	else
+	{
+		g_iCount++;
+	}
+#endif
+	if (g_dwMotorStep <= 0 && !g_bMotorClose)
+	{
+		g_bMotorClose = TRUE;
+		gpio_set_value(MOTOR_ENABLE_PIN, 0);
+	}
+	else if (g_dwMotorStep > 0)
+	{
+		g_bMotorClose = FALSE;
+		
+		if (!g_bHaltOperation) 
+		{
+			motor_single_step(g_ptMotorDev->bForward);
+			//schedule_work(&workq);
+			--g_dwMotorStep;
+		}
+		
+		g_bPostSemaphore = (g_dwMotorStep == 0) ? TRUE: FALSE;
+		if (g_bPostSemaphore)
+		{
+			up(&g_ptMotorDev->sem);
+			complete(&fd_complete);
+		}
+	}
+
+	return IRQ_HANDLED; // defined in linux/irqreturn.h
+}
+
+int motor_init_interrupt()
+{
+        init_completion(&fd_complete);
+        
+	return 0;
+}
+
+int motor_int_clear(char stat_clear)
+{
+        INIT_COMPLETION(fd_complete);
+        
+	return 0;
+}
+
+int motor_int_wait(char stat_wait)
+{
+        /* Waiting for steps to complete */
+        wait_for_completion_interruptible(&fd_complete);
+	INIT_COMPLETION(fd_complete);
+        
+	return 0;
+}
+/*****************************************************************************
+* init_davinci_timer (DM365 Only)
+*****************************************************************************/
+#ifdef _TI_DM365
+static void init_davinci_timer (DWORD dwTimerPeriod)
+{
+	DWORD dwTgcrReg, dwTcrReg;
+	dwTgcrReg = dwTcrReg = 0;
+
+	dwTcrReg = davinci_readl(MOTOR_TIMER3_BASE + TCR);
+	/* Disabled, Internal clock source */
+	davinci_writel(0, MOTOR_TIMER3_BASE + TCR);
+	/* reset both timers, no pre-scaler for timer34 */
+	davinci_writel(0, MOTOR_TIMER3_BASE + TGCR);
+
+	/* Set both timers to 64-bit */
+	dwTgcrReg = TGCR_TIMMODE_64BIT_GP << TGCR_TIMMODE_SHIFT;
+	davinci_writel(dwTgcrReg, MOTOR_TIMER3_BASE + TGCR);
+
+	/* Reset timers */
+	dwTgcrReg |= (TGCR_UNRESET << TGCR_TIM12RS_SHIFT) |
+	(TGCR_UNRESET << TGCR_TIM34RS_SHIFT);
+	davinci_writel(dwTgcrReg, MOTOR_TIMER3_BASE + TGCR);
+
+	/* Reset counter to zero */
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM12);
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM34);
+
+	/* Disable timer */
+	dwTcrReg &= ~(TCR_ENAMODE_MASK << ENAMODE12_SHIFT);
+	davinci_writel(dwTcrReg, MOTOR_TIMER3_BASE + TCR);
+
+	/* Set new period */
+	davinci_writel(dwTimerPeriod, MOTOR_TIMER3_BASE + PRD12); 
+	davinci_writel(0, MOTOR_TIMER3_BASE + PRD34);
+	dwTcrReg |= (TCR_ENAMODE_PERIODIC << ENAMODE12_SHIFT);
+	davinci_writel(dwTcrReg, MOTOR_TIMER3_BASE + TCR);
+
+	if (g_byDEBUG > 0)
+		DBG("%s init_davinci_timer. dwTimerPeriod:%d\n", MOTOR_SYSLOG_ID, dwTimerPeriod);
+}
+#endif //_TI_DM365
+/*****************************************************************************
+* init_mozart_timer (Mozart Only)
+*****************************************************************************/
+#ifdef _MOZART
+static void init_mozart_timer (DWORD dwTimer, DWORD dwTimerPeriod)
+{
+	DWORD dwReg, dwFlag, dwSetDownCount = 1;
+
+	dwReg = MOTOR_MOZART_READ(IO_ADDRESS(MOTOR_TIMER_CTRL));
+	// Disabled Timer Clock Source 
+	dwFlag = 0x7<<(0+dwTimer*4);
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_CTRL), dwReg & (~dwFlag));
+	dwReg = MOTOR_MOZART_READ(IO_ADDRESS(MOTOR_TIMER_CTRL));
+	//DBG("%s Disable MOTOR_TIMER_CTRL: 0x%X %p\n", MOTOR_SYSLOG_ID, dwReg, IO_ADDRESS(MOTOR_TIMER_CTRL));
+
+	// Set Timer Count Reload Period  
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_RELOAD), (APB_CLK)/HZ); // Speed Control 
+	//DBG("IOREMAP IO_ADDRESS(MOTOR_TIMER_RELOAD):%p\n", IO_ADDRESS(MOTOR_TIMER_RELOAD));
+	
+	// Set Timer Count Range   
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_COUT), dwTimerPeriod);
+	//DBG("IOREMAP IO_ADDRESS(MOTOR_TIMER_COUT):%p\n", IO_ADDRESS(MOTOR_TIMER_COUT));
+	
+	// Choice Timer Down/Up Count Mechanism  
+	dwSetDownCount = dwSetDownCount << (3+dwTimer*4);
+	dwReg = MOTOR_MOZART_READ(IO_ADDRESS(MOTOR_TIMER_CTRL));
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_CTRL), (dwReg & ~(1<<(3+dwTimer*4))) | dwSetDownCount);
+	//DBG("%s Disable dwSetDownCount: 0x%X %p\n", MOTOR_SYSLOG_ID, dwReg, IO_ADDRESS(MOTOR_TIMER_CTRL));
+
+	// Enable Timer Clock Source  
+	dwFlag = 0;
+	dwFlag = 0xF<<(0+dwTimer*4); // Force : 0xF 
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_CTRL), dwReg | dwFlag);
+	dwReg = MOTOR_MOZART_READ(IO_ADDRESS(MOTOR_TIMER_CTRL));
+	//DBG("%s Enable MOTOR_TIMER_CTRL: 0x%X %p\n", MOTOR_SYSLOG_ID, dwReg, IO_ADDRESS(MOTOR_TIMER_CTRL));
+	
+	if (g_byDEBUG > 0)
+		DBG("%s init_mozart_timer. dwTimer:%d dwTimerPeriod:%d\n", MOTOR_SYSLOG_ID, dwTimer, dwTimerPeriod);
+}
+/*****************************************************************************
+* mozart_i2c_write (Mozart Only)
+*****************************************************************************/
+int mozart_i2c_write(int count,  const char *buf, int address)
+{
+	struct i2c_client *client = g_I2Client;
+	struct i2c_adapter *adap = client->adapter;
+	struct i2c_msg msg;
+	int iRet;
+
+	msg.addr = address;
+	msg.flags = client->flags & I2C_M_TEN;
+	msg.len = count;
+	msg.buf = (char *)buf;
+
+	iRet = i2c_transfer(adap, &msg, 1);
+	/* If everything went ok (i.e. 1 msg transmitted), return #bytes
+	transmitted, else error code. */
+	return (iRet == 1) ? count : iRet;
+}
+#endif //_MOZART
+/*****************************************************************************
+* motor_timer_initial : timer initial and request a IRQ service routine.
+*****************************************************************************/
+static int motor_timer_initial(DWORD dwTimer, DWORD dwTimerPeriod)
+{
+	int iReturn = 0;
+
+	if (dwTimer != MOTOR_TIMER_NUM) // Use Timer 3
+		return -EFAULT;
+
+#if defined _TI_DM365
+	init_davinci_timer(dwTimerPeriod);
+#elif defined _MOZART
+	init_mozart_timer(dwTimer, dwTimerPeriod);
+	fLib_SetIntTrig(TMRC_TM3_IRQ_NUM, EDGE, L_ACTIVE); // Set IRQ Mode
+#else
+	return -EFAULT;
+#endif
+
+	iReturn = request_irq(MOTOR_IRQ_TIMER3, (void *)motor_isr, IRQF_DISABLED | IRQF_TIMER | IRQF_SHARED, "FocusMotor", irq_dev_id);
+
+	if (iReturn != S_OK)
+	{
+		DBG("%s request_irq fail iReturn:%d IRQ:0x%X\n", MOTOR_SYSLOG_ID, iReturn, MOTOR_IRQ_TIMER3);
+	}
+	else
+	{
+		if (g_byDEBUG > 0)
+			DBG("%s motor_timer_initial. MOTOR_IRQ_TIMER3:%d \n", MOTOR_SYSLOG_ID, MOTOR_IRQ_TIMER3);
+		disable_irq(MOTOR_IRQ_TIMER3);
+		enable_irq(MOTOR_IRQ_TIMER3);
+	}	
+
+	return (iReturn);
+}
+/******************************************************************************
+* motor_timer_period_setup : change the motor speed
+*****************************************************************************/
+static int motor_timer_period_setup(DWORD dwSpeed)
+{
+	DWORD dwTimerPeriod = 0;
+	dwTimerPeriod = (dwSpeed > MOTOR_TIMER_SPEED_NUM) ? g_dwMotorSpeed[0] : g_dwMotorSpeed[dwSpeed];
+	
+#if defined _TI_DM365
+	DWORD dwTcrReg = 0;
+	
+	/* Clear counter and period regs */
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM12);
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM34);
+	
+	/* Disable Timer */
+	dwTcrReg &= ~(TCR_ENAMODE_MASK << ENAMODE12_SHIFT);
+	davinci_writel(dwTcrReg, MOTOR_TIMER3_BASE + TCR);
+	
+	/* Set new period */
+	davinci_writel(dwTimerPeriod, MOTOR_TIMER3_BASE + PRD12); 
+	davinci_writel(0, MOTOR_TIMER3_BASE + PRD34);
+	if (g_byDEBUG > 0) 
+		DBG("%s Set Timer Period :%x \n", MOTOR_SYSLOG_ID, dwTimerPeriod);
+
+	dwTcrReg = davinci_readl(MOTOR_TIMER3_BASE + TCR);
+
+	/* Enable Timer */
+	dwTcrReg |= (TCR_ENAMODE_MASK << ENAMODE12_SHIFT);
+	davinci_writel(dwTcrReg, MOTOR_TIMER3_BASE + TCR);
+#elif defined _MOZART
+	/* Set Timer Count Reload Period */
+	MOTOR_MOZART_WRITE( IO_ADDRESS(MOTOR_TIMER_RELOAD), dwTimerPeriod); // Speed Control 
+#endif
+	return 0;
+}
+/* ============================================================================= */
+/******************************************************************************
+* motor_open : open VFS /dev/focusmotor to do
+*****************************************************************************/
+static int motor_open (struct inode *inode, struct file *filp)
+{
+	int	iReturn = 0;
+
+	//printk("%s count:%d flag:%d\n", MOTOR_SYSLOG_ID, filp->f_count, filp->f_flags);
+	if (ac_tSystemInUse.counter > 0)
+		return -EBUSY;
+
+	// kmalloc for motor device structure used.
+	g_ptMotorDev = kmalloc(sizeof(TMotorDev), GFP_KERNEL);
+	if (!g_ptMotorDev) 
+	{
+		iReturn = -ENOMEM;
+	}
+	memset(g_ptMotorDev, 0, sizeof(TMotorDev));
+
+#if defined _TI_DM365
+	INIT_WORK(&workq, motor_workqueue, 0); // #define INIT_WORK(_work, _func, _data), by Kernel 2.6.18
+#elif defined _MOZART
+	INIT_WORK(&workq, motor_workqueue); // #define INIT_WORK(_work, _func), by Kernel 2.6.28
+#endif
+	
+	init_MUTEX(&g_ptMotorDev->sem); // initial a semaphore
+
+	// Check the Lens model: FD8362:DF010NA0000, FD8372:YC41AM
+	if (strncmp(g_pcLens, "YC41AM", 6) == 0)
+		g_dwMotorSpeed = g_dwMotorSpeed_YC41AM;
+	else
+		g_dwMotorSpeed = g_dwMotorSpeed_DF010NA0000; // default: Tamron
+
+	if (g_iMoveInverse) // FD8362:0, FD8372:1
+	{
+		g_acForwardCmd = g_acMoveClockwise;	
+		g_acBackwardCmd = g_acMoveCounterclockwise;	
+	}
+	else // FD8362
+	{
+		g_acBackwardCmd = g_acMoveClockwise;	
+		g_acForwardCmd = g_acMoveCounterclockwise;	
+	}
+
+	if (motor_timer_initial(MOTOR_TIMER_NUM, g_dwMotorSpeed[0]) != S_OK)
+	{
+		iReturn = -EFAULT;
+		goto Fail_GoTo;
+	}
+
+	filp->private_data = g_ptMotorDev;
+	ac_tSystemInUse = filp->f_count;
+
+#if defined _GPIO_MODE
+	motor_set_device(g_ptMotorDev, mdmGPIO);
+	motor_set_gpio_dire_output(g_ptMotorDev, MOTOR_ENABLE_PIN);
+	motor_set_gpio_dire_output(g_ptMotorDev, MOTOR_GPIO_PIN_NUM_1);
+	motor_set_gpio_dire_output(g_ptMotorDev, MOTOR_GPIO_PIN_NUM_2);
+#elif defined _I2C_MODE
+	motor_set_device(g_ptMotorDev, mdmIOEXPAND);
+	motor_set_i2c_client_addr(g_ptMotorDev, MOTOR_I2C_CLIENT_PCA9536_ADDRESS);
+	g_ptMotorDev->dwI2CAddr = MOTOR_I2C_CLIENT_PCA9536_ADDRESS; // default address
+#endif 
+
+	DBG("%s driver open. \n", MOTOR_SYSLOG_ID);
+	return 0;
+
+
+Fail_GoTo:
+	if (g_ptMotorDev)
+		kfree(g_ptMotorDev);
+
+	ac_tSystemInUse.counter = 0;
+	return (iReturn);
+}    
+/******************************************************************************
+* motor_ioctl - function to implement the GPIO ioctl's
+*****************************************************************************/
+static int motor_ioctl (struct inode *inode, struct file *filp, 
+						unsigned int cmd, DWORD dwArg)
+{
+	TMotorDev *ptDevice = (TMotorDev *)filp->private_data;
+	SCODE scResult = 0;
+	DWORD dwNum, dwMajor;
+
+	if (g_byDEBUG > 0)
+		DBG("type: '%c' cmd: 0x%x dwArg:%d \n", _IOC_TYPE( cmd ), _IOC_NR( cmd ), dwArg);
+
+	if ((_IOC_TYPE( cmd ) != MOTOR_MAGIC ) || (_IOC_NR( cmd ) > MOTOR_MAXNR ))
+	{
+		return -ENOTTY;
+	}
+
+	/*-------------------------------------------------------------------
+	* the direction is a bitmask, and VERIFY_WRITE catches R/W
+	* transfers. `Type' is user-oriented, while
+	* access_ok is kernel-oriented, so the concept of "read" and
+	* "write" is reversed
+	*-------------------------------------------------------------------*/
+	if (_IOC_DIR(cmd) & _IOC_READ)
+	{
+		scResult = !access_ok(VERIFY_WRITE, (void *)dwArg, _IOC_SIZE(cmd));
+	}
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+	{
+		scResult = !access_ok(VERIFY_READ, (void *)dwArg, _IOC_SIZE(cmd));
+	}
+
+	if (scResult != 0)
+	{
+		if (g_byDEBUG > 0) 
+			DBG("%s ioctl command type. \n", MOTOR_SYSLOG_ID);
+		return -EFAULT;
+	}
+
+	dwNum = MINOR(inode->i_rdev);
+	dwMajor = MAJOR(inode->i_rdev);
+
+	switch (cmd) 
+	{
+	case MOTOR_SET_FORWARD:
+		scResult = motor_set_forward(ptDevice);
+		break;
+	case MOTOR_SET_BACKWARD:
+		scResult = motor_set_backward(ptDevice);
+		break;
+	case MOTOR_SET_SPEED:
+		scResult = motor_set_speed(ptDevice, dwArg);
+		break;
+	case MOTOR_WALK_STEPS:
+		if (dwArg != 0)
+		{
+			scResult = motor_walk_steps(ptDevice, dwArg);
+			//scResult = motor_walk_steps_block(ptDevice, dwArg);
+		}
+		else
+		{
+			scResult = -EINVAL;
+		}
+		break;
+	case MOTOR_WALK_STEPS_BLOCK:
+		if (dwArg != 0)
+		{
+			scResult = motor_walk_steps_block(ptDevice, dwArg);
+		}
+		else
+		{
+			scResult = -EINVAL;
+		}
+		break;
+	case MOTOR_WALK_STEPS_CLR:
+		g_bHaltOperation = TRUE;
+		if (g_dwMotorStep == 0)
+		{
+			scResult = 0;
+		}
+		else
+		{
+			scResult = g_dwMotorStep - 1;
+			g_dwMotorStep = 1; // Clear the current walk steps, Forced to set the remaining 1 step
+		}
+		g_bHaltOperation = FALSE;
+		break;
+	case MOTOR_SET_MSG_LEVEL:
+		g_byDEBUG = dwArg;
+		break;
+	case MOTOR_SYS_LOG_LIST:
+		scResult = motor_system_log(ptDevice, dwArg);
+		break;
+	case MOTOR_TURN_OFF:
+		// Turn off motors for thermal issue
+		gpio_set_value(MOTOR_ENABLE_PIN, 0x00);
+		break;
+	default:
+		return -ENOTTY;
+		break;
+	}
+
+	return (scResult);
+}
+/******************************************************************************
+* motor_read : reserve
+*****************************************************************************/
+//static ssize_t motor_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
+//{
+//	TMotorDev *ptDevice = filp->private_data;
+//	int iRet = 0;
+/*
+	if (copy_to_user(buf, "Hello Evan!!", count))
+	{
+		iRet = -EFAULT;
+	}*/
+
+//	return (iRet);
+//}
+/******************************************************************************
+* motor_write : reserve
+*****************************************************************************/
+static ssize_t motor_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
+{
+//	TMotorDev *ptDevice = filp->private_data;
+	int iRet = 0;
+/*
+	DBG("written %d bytes(s), buf:%s \n", count, buf);
+	if (copy_from_user(ptDevice->byBuf, buf, count))
+	{
+		iRet = -EFAULT;
+	}
+*/
+	return (iRet);
+}					 
+/******************************************************************************
+* motor_release
+*****************************************************************************/
+static int motor_release(struct inode *inode, struct file *filp)
+{
+	TMotorDev *ptDevice = (TMotorDev *)filp->private_data;
+#ifdef _TI_DM365
+	// Reset the timer count and interrupt period.
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM12);
+	davinci_writel(0, MOTOR_TIMER3_BASE + TIM34);
+	davinci_writel(0, MOTOR_TIMER3_BASE + PRD12); 
+	davinci_writel(0, MOTOR_TIMER3_BASE + PRD34);
+#endif //_TI_DM365
+	flush_scheduled_work();
+	// free irq handler
+	free_irq(MOTOR_IRQ_TIMER3, irq_dev_id);
+
+	if (ptDevice)
+		kfree(ptDevice);
+
+	ac_tSystemInUse.counter = 0;
+	gpio_set_value(MOTOR_ENABLE_PIN, 0);
+	DBG("%s driver release. \n", MOTOR_SYSLOG_ID);
+	return 0;
+} 
+/* ============================================================================= */
+#ifdef _MOZART
+/*****************************************************************************
+* i2c_expander_detect (Mozart Only)
+*****************************************************************************/
+static int i2c_expander_detect(struct i2c_adapter *adapter, int address, int kind)
+{
+	int iRet = 0;
+	struct i2c_client *ptClient; 
+	struct PCA953X *pca9536;
+
+	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C | I2C_FUNC_SMBUS_READ_BYTE | I2C_FUNC_SMBUS_WRITE_BYTE_DATA)) 
+	{
+		iRet = -ENODEV;
+		goto exit;
+	}
+
+	ptClient = kzalloc(sizeof(struct i2c_client), GFP_KERNEL);
+	if (ptClient == 0)
+	{
+		iRet = -ENOMEM;
+		goto exit;
+	}
+
+	g_I2Client = ptClient;
+	ptClient->addr = address;
+	ptClient->adapter = adapter;
+	ptClient->driver = &i2c_expander_driver;
+	strlcpy(I2C_NAME(ptClient), "pca9536", sizeof(I2C_NAME(ptClient)));
+	
+	pca9536 = kzalloc(sizeof(struct PCA953X), GFP_KERNEL);
+	if (pca9536 == NULL) {
+		kfree(ptClient);
+		iRet = -ENOMEM;
+		goto exit;
+	}
+
+	i2c_set_clientdata(ptClient, pca9536);
+
+	iRet = i2c_attach_client(ptClient);
+	if (iRet) {
+		kfree(ptClient);
+		kfree(pca9536);
+		return iRet;
+	}
+exit:
+	return iRet;
+}
+/*****************************************************************************
+* i2c_expander_attach_adapter (Mozart Only)
+*****************************************************************************/
+static int i2c_expander_attach_adapter(struct i2c_adapter *adapter)
+{
+	DBG("%s starting probe for adapter %s (0x%x)\n", MOTOR_SYSLOG_ID, adapter->name, adapter->id);
+	return i2c_probe(adapter, &addr_data, &i2c_expander_detect);
+}
+/*****************************************************************************
+* i2c_expander_detach_client (Mozart Only)
+*****************************************************************************/
+static int i2c_expander_detach_client(struct i2c_client *client)
+{
+	struct PCA953X *pca9536 = i2c_get_clientdata(client);
+	int err;
+
+	err = i2c_detach_client(client);
+	if (err) {
+		return err;
+	}
+
+	kfree(pca9536);
+	kfree(client);
+
+	return 0;
+}
+#endif //_MOZART
+/* ============================================================================= */
+#ifdef _MOZART
+/* This is the driver that will be inserted */
+static struct i2c_driver i2c_expander_driver = {
+	.driver = {
+		.name   = "PCA9536",
+	},
+	.attach_adapter = i2c_expander_attach_adapter,
+	.detach_client  = i2c_expander_detach_client,
+	.id				= MOTOR_I2C_CLIENT_PCA9536_ADDRESS,
+};
+#endif 
+
+/* declare file operation structure */
+static struct file_operations motor_fops = {
+	owner: 		THIS_MODULE,
+	open:		motor_open,
+	ioctl:		motor_ioctl,
+	//read:		motor_read,
+	write:		motor_write,
+	release:	motor_release,
+};
+/*****************************************************************************
+* motor_init_module - initialize motor module
+****************************************************************************/
+int motor_init_module ()
+{
+    int iReturn = 0;
+
+    if (register_chrdev(MOTOR_MAJOR_DEFAULT, MOTOR_VFS_INTERFACE, &motor_fops) < 0) 
+    {
+		DBG("%s Couln't register a device.", MOTOR_SYSLOG_ID);
+		return -EFAULT;
+    }
+#ifdef _MOZART	
+	i2c_add_driver(&i2c_expander_driver);
+	DBG("%s driver install. \n", MOTOR_SYSLOG_ID);
+#endif 
+	motor_init_interrupt();
+	
+	DBG("\nLENS_MODEL:%s\n", g_pcLens);
+
+	return (iReturn);
+}
+/*****************************************************************************
+* motor_cleanup_module - cleanup motor module
+****************************************************************************/
+void motor_cleanup_module ()
+{
+	unregister_chrdev(MOTOR_MAJOR_DEFAULT, MOTOR_VFS_INTERFACE);
+#ifdef _MOZART	
+	i2c_del_driver(&i2c_expander_driver);
+	DBG("%s driver unloaded. \n", MOTOR_SYSLOG_ID);
+#endif 
+}
+/* ============================================================================= */
+/* Register driver to the kernel */
+module_init(motor_init_module);
+module_exit(motor_cleanup_module);
+/* ============================================================================= */
+MODULE_AUTHOR("VIVOTEK Inc.");
+MODULE_DESCRIPTION("Focus Motor Driver");
+MODULE_SUPPORTED_DEVICE("MD124 motor driver + PCA9536 I2C expander");
+MODULE_LICENSE("GPL");
+/* ============================================================================= */
